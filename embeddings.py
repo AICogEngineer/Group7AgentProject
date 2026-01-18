@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 
 # LangChain & AWS Imports
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_aws import BedrockEmbeddings
 from pinecone import Pinecone, ServerlessSpec
@@ -42,58 +41,51 @@ def policy_chunking(file_path: str) -> List[Document]:
     ex: "2.1", "2.2", etc
     """
     
-    # 1. Load the PDF
+    # Load the PDF
     loader = PyPDFLoader(file_path)
     raw_pages = loader.load()
     
-    # 2. Merge pages to handle cross-page sections
+    # Merge pages to handle cross-page sections
     full_text = "\n".join([page.page_content for page in raw_pages])
-    
-    # 3. Clean artifacts (Remove '--- PAGE X ---')
-    full_text = re.sub(r'--- PAGE \d+ ---', '', full_text)
+    # join broken words
+    full_text = re.sub(r'(\w)\n(\w)', r'\1\2', full_text) 
+    # join newline that aren't section numbers
+    full_text = re.sub(r'(?<!\.)\n(?![0-9])', ' ', full_text)
+    # join multiple spaces
+    full_text = re.sub(r' +', ' ', full_text)
 
-    # 4. Regex Splitter: Looks for Section Headers (e.g., "1.2 ", "10.1 ")
+    # Regex Splitter: Looks for Section Headers (e.g., "1.2 ", "10.1 ")
     #    This ensures "Section 4.2 Returnless Refund" stays as one unit.
-    section_pattern = r'(?=\n\d+(\.\d+)*\s+[A-Z])'
+    section_pattern = r'\n(?:(?=[1-9])|\s*(?=1[0-4]))(?=\b(?:[1-9]|1[0-4])(?:\.\d+)*(?!\d*:)(?!\d*\.\d)\.?\s+[\"\'A-Z])'
     raw_chunks = re.split(section_pattern, full_text)
     
     processed_documents = []
-    
     for chunk in raw_chunks:
-        if not chunk or len(chunk.strip()) < 50:
+        chunk = chunk.strip()
+        if not chunk or len(chunk) < 20:
             continue
             
-        # 5. Metadata Enrichment
-        lines = chunk.strip().split('\n')
-        header_line = lines[0] if lines else "General Policy"
-        
-        # Prepend context so the embedding vector "knows" which section this is
+        lines = chunk.split('\n')
+        header_line = lines[0]
         doc = Document(
-            page_content=f"SOURCE SECTION: {header_line}\n\nCONTENT:\n{chunk.strip()}",
+            page_content=chunk,
             metadata={
                 "source": "Master Policy",
                 "section_header": header_line[:100], 
-                "policy_type": "compliance"
+                "policy_type": "compliance",
+                "text": chunk
             }
         )
         processed_documents.append(doc)
 
-    # 6. Safety Split: Handle massive sections
-    recursive_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", " ", ""]
-    )
-    
-    final_docs = recursive_splitter.split_documents(processed_documents)
-    print(f"Generated {len(final_docs)} semantic chunks.")
-    return final_docs
+    print(f"Generated {len(processed_documents)} policy sections.")
+    return processed_documents
 
 def upload_to_pinecone(documents: List[Document]):
     """
     Embeds using Amazon Bedrock and upserts to Pinecone.
     """
-    # Create Index if needed (Ensure dimensions match Titan model: 1536)
+
     if INDEX_NAME not in pc.list_indexes().names():
         pc.create_index(
             name=INDEX_NAME,
@@ -104,17 +96,16 @@ def upload_to_pinecone(documents: List[Document]):
         print(f"Created new index: {INDEX_NAME}")
         
     index = pc.Index(INDEX_NAME)
-    
-    # Batch process to respect API limits
     batch_size = 50 
     total_docs = len(documents)
     
     for i in range(0, total_docs, batch_size):
         batch = documents[i:i+batch_size]
         
-        # 1. Create Embeddings via Bedrock
+        # 1. Create Embeddings
         texts = [d.page_content for d in batch]
         metadatas = [d.metadata for d in batch]
+
         ids = [str(i + idx) for idx, _ in enumerate(batch)]
         
         try:
@@ -123,7 +114,6 @@ def upload_to_pinecone(documents: List[Document]):
             # 2. Upsert to Pinecone
             vectors_to_upsert = list(zip(ids, embeds, metadatas))
             index.upsert(vectors=vectors_to_upsert)
-            
             print(f"Upserted batch {i} to {i+len(batch)}")
             
         except Exception as e:
