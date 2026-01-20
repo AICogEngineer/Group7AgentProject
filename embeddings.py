@@ -56,7 +56,7 @@ def policy_chunking(file_path: str) -> List[Document]:
 
     # Regex Splitter: Looks for Section Headers (e.g., "1.2 ", "10.1 ")
     #    This ensures "Section 4.2 Returnless Refund" stays as one unit.
-    section_pattern = r'\n(?:(?=[1-9])|\s*(?=1[0-4]))(?=\b(?:[1-9]|1[0-4])(?:\.\d+)*(?!\d*:)(?!\d*\.\d)\.?\s+[\"\'A-Z])'
+    section_pattern = r'(?:\n(?:(?=[1-9])|\s*(?=1[0-4]))(?=\b(?:[1-9]|1[0-4])(?:\.\d+)*(?!\d*:)(?!\d*\.\d)\.?\s+[\"\'A-Z]))|(?:\b10\.1\.5\b)'
     raw_chunks = re.split(section_pattern, full_text)
     
     processed_documents = []
