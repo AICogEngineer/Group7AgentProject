@@ -47,11 +47,11 @@ def policy_chunking(file_path: str) -> List[Document]:
     
     # Merge pages to handle cross-page sections
     full_text = "\n".join([page.page_content for page in raw_pages])
-    # join broken words
+    # Join broken words
     full_text = re.sub(r'(\w)\n(\w)', r'\1\2', full_text) 
-    # join newline that aren't section numbers
+    # Join newline that aren't section numbers
     full_text = re.sub(r'(?<!\.)\n(?![0-9])', ' ', full_text)
-    # join multiple spaces
+    # Join multiple spaces
     full_text = re.sub(r' +', ' ', full_text)
 
     # Regex Splitter: Looks for Section Headers (e.g., "1.2 ", "10.1 ")
