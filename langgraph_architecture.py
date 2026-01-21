@@ -1,17 +1,17 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
 import boto3
 from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, END
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
 
 AWS_BEARER_TOKEN_BEDROCK = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
 
 # --- State Definition ---
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     messages: List[BaseMessage]
     user_id: str
     is_verified: bool
