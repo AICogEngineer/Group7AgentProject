@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import boto3
 from typing import TypedDict, List, Optional, Annotated
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, START, END
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage
 
@@ -90,9 +90,23 @@ def route_verification(state: AgentState):
     return "data_fetch" if state["is_verified"] else END
 
 # Construct Edges
-builder.set_entry_point("intent_router")
-builder.add_conditional_edges("intent_router", route_intent)
-builder.add_conditional_edges("identity_check", route_verification)
+builder.add_edge(START, "intent_router")
+builder.add_conditional_edges(
+    "intent_router",
+    route_intent, # This is the function we defined earlier
+    {
+        "transactional": "identity_check", # Map return value to node name
+        "general": "general_rag"           # Map return value to node name
+    }
+)
+builder.add_conditional_edges(
+    "identity_check",
+    route_verification,
+    {
+        "data_fetch": "data_fetch",
+        "END": END
+    }
+)
 
 builder.add_edge("general_rag", END)
 builder.add_edge("data_fetch", "fraud_check")
