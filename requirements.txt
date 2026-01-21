@@ -1,1 +1,20 @@
+# --- AWS and Foundation Models ---
+boto3
+langchain-aws
 langgraph-cli[inmem]
+
+# --- Vector Database (Pinecone) ---
+pinecone
+
+# --- Orchestration and Logic ---
+langchain
+langchain-aws
+langchain-core
+langchain-community
+langgraph
+
+# --- Document Processing ---
+pypdf
+
+# --- Utilities ---
+python-dotenv
