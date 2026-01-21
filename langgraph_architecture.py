@@ -6,6 +6,32 @@ from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, END
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage
+from langchain_aws import BedrockEmbeddings
+from pinecone import Pinecone
+
+#Configurations
+INDEX_NAME = "ecommerce-policy-rag"
+AWS_REGION = os.getenv("AWS_REGION")
+BEARER_TOKEN = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
+BEDROCK_MODEL_ID = "amazon.titan-embed-text-v2:0"
+
+# Setup Bedrock Client with the Bearer Token
+# This matches your ingestion setup
+boto_client = boto3.client(
+    "bedrock-runtime",
+    region_name=AWS_REGION
+)
+# 2. Initialize Embeddings (Must match the 1024 dimensions used in ingestion)
+embeddings = BedrockEmbeddings(
+    client=boto_client,
+    model_id=BEDROCK_MODEL_ID,
+    model_kwargs={"dimensions": 1024}
+)
+
+
+# Setup Pinecone Index
+pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+index = pc.Index("ecommerce-policy-rag")
 
 
 AWS_BEARER_TOKEN_BEDROCK = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
@@ -49,17 +75,52 @@ def identity_gate(state: AgentState):
 
 def policy_rag_node(state: AgentState):
     """Path A: Pinecone-only lookup for general queries."""
-    # Simulated Pinecone fetch
-    policy_text = "Standard return window is 30 days for electronics."
-    return {"policy_context": policy_text}
+    
+    # Get the last user message to use as a search query
+    user_query = state['messages'][-1].content
+    
+    # 1. Generate the vector for the question using Bedrock
+    query_vector = embeddings.embed_query(user_query)
+    
+    # 2. Search Pinecone index
+    results = index.query(
+        vector=query_vector,
+        top_k=2,
+        include_metadata=True
+    )
+    
+    # 3. Format the retrieved context
+    if results['matches']:
+        # Combine the top matches into a single string for the LLM to read
+        retrieved_text = "\n\n".join([
+            match['metadata'].get('text', 'No text found') 
+            for match in results['matches']
+        ])
+    else:
+        retrieved_text = "No relevant policy sections found."
+
+    return {"policy_context": retrieved_text}
 
 def secure_data_retrieval(state: AgentState):
     """FEATURE 1: Dual-tool call (Snowflake + Pinecone) after verification."""
-    # Fetch from Snowflake Gold Zone (Mock)
+    # 1. Fetch from Snowflake Gold Zone (Stay Mocked for now)
     snowflake_data = {"order_date": "2025-12-01", "refunds_last_30d": 5}
     
-    # Fetch from Pinecone (Mock)
-    policy_data = "Refunds are denied if velocity exceeds 3 per month."
+    # 2. Real Fetch from Pinecone
+    user_query = state['messages'][-1].content
+    query_vector = embeddings.embed_query(user_query)
+    
+    results = index.query(
+        vector=query_vector, 
+        top_k=1, 
+        include_metadata=True
+    )
+    
+    # SAFE CHECK: Always check if matches exists before accessing index [0]
+    if results and 'matches' in results and len(results['matches']) > 0:
+        policy_data = results['matches'][0]['metadata'].get('text', 'Policy text missing')
+    else:
+        policy_data = "No relevant policy found for this specific query."
     
     return {"order_context": snowflake_data, "policy_context": policy_data}
 
