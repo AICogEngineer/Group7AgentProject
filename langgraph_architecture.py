@@ -4,6 +4,7 @@ load_dotenv()
 import boto3
 from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage
 
@@ -12,7 +13,7 @@ AWS_BEARER_TOKEN_BEDROCK = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
 
 # --- State Definition ---
 class AgentState(TypedDict, total=False):
-    messages: List[BaseMessage]
+    messages: Annotated[List[BaseMessage], add_messages]
     user_id: str
     is_verified: bool
     intent: str               # 'general' or 'transactional'
@@ -33,12 +34,39 @@ llm = ChatBedrockConverse(
 # --- Node Logic ---
 
 def intent_router_node(state: AgentState):
-    """Uses Bedrock to determine if the query is general or transactional."""
-    prompt = f"Analyze if this request requires personal order data or just general policy info: {state['messages'][-1].content}"
+    """AI decides the intent directly and we extract it from the message content."""
+    
+    # 1. Get the user's last message text safely
+    last_msg = state["messages"][-1].content
+    user_text = last_msg[0].get("text", "") if isinstance(last_msg, list) else str(last_msg)
+
+    # 2. Force the model to categorize the intent in its response
+    prompt = (
+        f"User Query: {user_text}\n\n"
+        "Analyze the query above. If the user is asking about a specific order, "
+        "refund status, or personal transaction, respond with 'INTENT: TRANSACTIONAL'. "
+        "If they are asking a general policy question, respond with 'INTENT: GENERAL'."
+    )
+    
+    # 3. Invoke the model
     response = llm.invoke([HumanMessage(content=prompt)])
     
-    intent = "transactional" if "order" in response.content.lower() or "refund" in response.content.lower() else "general"
-    return {"intent": intent}
+    # 4. Safely extract text from Nova's content list
+    # Nova content is often: [{'type': 'text', 'text': '...'}]
+    res_content = response.content
+    if isinstance(res_content, list):
+        conclusion = next((block["text"] for block in res_content if block.get("type") == "text"), "")
+    else:
+        conclusion = str(res_content)
+
+    # 5. Decide intent based on the model's text conclusion
+    conclusion = conclusion.upper()
+    intent = "transactional" if "TRANSACTIONAL" in conclusion else "general"
+    
+    return {
+        "intent": intent,
+        "messages": [response]
+    }
 
 def identity_gate(state: AgentState):
     """FEATURE 2: Security Gate. Interrupts if verification is missing."""
@@ -70,6 +98,23 @@ def fraud_analysis_node(state: AgentState):
         flags.append("REFUND_VELOCITY_EXCEEDED")
     return {"red_flags": flags}
 
+def responder_node(state: AgentState):
+    """Synthesizes the final answer for the user."""
+    # Use the context gathered in previous nodes
+    context = state.get("policy_context", "No policy found.")
+    order_info = state.get("order_context", "")
+    
+    prompt = f"""
+    Context: {context}
+    User Order Info: {order_info}
+    User Question: {state['messages'][-1].content}
+    
+    Please provide a helpful and professional response based on the info above.
+    """
+    
+    response = llm.invoke([HumanMessage(content=prompt)])
+    return {"messages": [response], "draft_response": response.content}
+
 # --- Graph Construction ---
 
 builder = StateGraph(AgentState)
@@ -81,10 +126,12 @@ builder.add_node("general_rag", policy_rag_node)
 builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("human_review", lambda x: x) # Placeholder for HITL
+builder.add_node("responder", responder_node)
 
 # Define Routing Logic
 def route_intent(state: AgentState):
-    return "identity_check" if state["intent"] == "transactional" else "general_rag"
+    intent = state.get("intent", "general")
+    return intent
 
 def route_verification(state: AgentState):
     return "data_fetch" if state["is_verified"] else END
@@ -108,10 +155,11 @@ builder.add_conditional_edges(
     }
 )
 
-builder.add_edge("general_rag", END)
+builder.add_edge("general_rag", "responder")
 builder.add_edge("data_fetch", "fraud_check")
 builder.add_edge("fraud_check", "human_review")
-builder.add_edge("human_review", END)
+builder.add_edge("human_review", "responder")
+builder.add_edge("responder", END)
 
 # Compile with Human-in-the-Loop Interrupt
 app = builder.compile(interrupt_before=["human_review"])
