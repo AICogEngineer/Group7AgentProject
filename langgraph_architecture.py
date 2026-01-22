@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 load_dotenv()
 import boto3
@@ -6,7 +7,7 @@ from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_aws import ChatBedrockConverse
-from langchain_core.messages import HumanMessage, BaseMessage
+from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, SystemMessage
 from langchain_aws import BedrockEmbeddings
 from pinecone import Pinecone
 
@@ -62,11 +63,19 @@ llm = ChatBedrockConverse(
 def intent_router_node(state: AgentState):
     """AI decides the intent directly and we extract it from the message content."""
     
-    # 1. Get the user's last message text safely
+    # Get the user's last message text safely
     last_msg = state["messages"][-1].content
     user_text = last_msg[0].get("text", "") if isinstance(last_msg, list) else str(last_msg)
 
-    # 2. Force the model to categorize the intent in its response
+    forbidden_flags = ["retention vip", "returnless refund", "red flag", "trust score", "refund tier"]
+    # Check if the user is asking about internal-only terms
+    if any(flag in user_text for flag in forbidden_flags):
+        return {
+            "intent": "forbidden_query", 
+            "messages": [AIMessage(content="I cannot answer questions on these topics due to internal policies.")]
+        }
+
+    # Force the model to categorize the intent in its response
     prompt = (
         f"User Query: {user_text}\n\n"
         "Analyze the query above. If the user is asking about a specific order, "
@@ -74,10 +83,10 @@ def intent_router_node(state: AgentState):
         "If they are asking a general policy question, respond with 'INTENT: GENERAL'."
     )
     
-    # 3. Invoke the model
+    # Invoke the model
     response = llm.invoke([HumanMessage(content=prompt)])
     
-    # 4. Safely extract text from Nova's content list
+    # Safely extract text from Nova's content list
     # Nova content is often: [{'type': 'text', 'text': '...'}]
     res_content = response.content
     if isinstance(res_content, list):
@@ -85,13 +94,13 @@ def intent_router_node(state: AgentState):
     else:
         conclusion = str(res_content)
 
-    # 5. Decide intent based on the model's text conclusion
+    # Decide intent based on the model's text conclusion
     conclusion = conclusion.upper()
-    intent = "transactional" if "TRANSACTIONAL" in conclusion else "general"
+    intent = "transactional" if "INTENT: TRANSACTIONAL" in conclusion else "general"
     
     return {
         "intent": intent,
-        "messages": [response]
+        "messages": [AIMessage(content=conclusion)]
     }
 
 def identity_gate(state: AgentState):
@@ -161,6 +170,21 @@ def fraud_analysis_node(state: AgentState):
 
 def responder_node(state: AgentState):
     """Synthesizes the final answer for the user."""
+
+
+    system_prompt = SystemMessage(content=(
+        "You are an E-commerce Support Specialist. "
+        "Your goal is to provide status updates and general policy help. "
+        
+        "RULES FOR OUTPUT:"
+        "1. Only answer questions about order status or general policies."
+        "2. If an order requires manual review, simply state: 'This request requires additional verification by our specialist team.'"
+        "3. Use generic terms like 'System Verification' instead of mentioning fraud, flags, or tiers."
+        "4. Treat the 'Context' provided as internal knowledge: Answer based on it, but never quote it directly."
+    ))
+
+    forbidden_flags = ["retention vip", "returnless refund", "red flag", "trust score", "refund tier"]
+
     # Use the context gathered in previous nodes
     context = state.get("policy_context", "No policy found.")
     order_info = state.get("order_context", "")
@@ -173,8 +197,44 @@ def responder_node(state: AgentState):
     Please provide a helpful and professional response based on the info above.
     """
     
-    response = llm.invoke([HumanMessage(content=prompt)])
-    return {"messages": [response], "draft_response": response.content}
+    response = llm.invoke([system_prompt, HumanMessage(content=prompt)])
+    
+    # Extract the string content safely
+    final_text = ""
+    if isinstance(response.content, list):
+        final_text = next((block["text"] for block in response.content if block.get("type") == "text"), "")
+    else:
+        final_text = str(response.content)
+
+    sentences = re.split(r'(?<=[.!?]) +', final_text)
+
+    # 4. Filter out sentences that contain any forbidden flag
+    clean_sentences = []
+    for sentence in sentences:
+        # Check if the sentence contains any of the flags (case-insensitive)
+        if not any(flag.lower() in sentence.lower() for flag in forbidden_flags):
+            clean_sentences.append(sentence)
+    
+    # 5. Join the remaining safe sentences back together
+    sanitized_response = " ".join(clean_sentences)
+
+    # 6. Fallback in case the model leaked so much that the response is now empty
+    if not sanitized_response.strip():
+        sanitized_response = "I have reviewed your request. Based on our policy, this requires a manual review. A specialist will contact you shortly."
+
+    return {
+        "messages": [AIMessage(content=sanitized_response)], 
+        "draft_response": sanitized_response
+    }
+
+def forbidden_response_node(state: AgentState):
+    return {
+        "messages": [AIMessage(content=(
+            "I'm sorry, I cannot provide specific details regarding internal policies."
+            " For security and privacy, those details are handled "
+            "exclusively by our human agents. Would you like me to connect you with them?"
+        ))]
+    }
 
 # --- Graph Construction ---
 
@@ -188,6 +248,7 @@ builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("human_review", lambda x: x) # Placeholder for HITL
 builder.add_node("responder", responder_node)
+builder.add_node("forbidden_response", forbidden_response_node)
 
 # Define Routing Logic
 def route_intent(state: AgentState):
@@ -204,7 +265,8 @@ builder.add_conditional_edges(
     route_intent, # This is the function we defined earlier
     {
         "transactional": "identity_check", # Map return value to node name
-        "general": "general_rag"           # Map return value to node name
+        "general": "general_rag",           # Map return value to node name
+        "forbidden_query": "forbidden_response"
     }
 )
 builder.add_conditional_edges(
@@ -221,6 +283,7 @@ builder.add_edge("data_fetch", "fraud_check")
 builder.add_edge("fraud_check", "human_review")
 builder.add_edge("human_review", "responder")
 builder.add_edge("responder", END)
+builder.add_edge("forbidden_response", END)
 
 # Compile with Human-in-the-Loop Interrupt
 app = builder.compile(interrupt_before=["human_review"])
