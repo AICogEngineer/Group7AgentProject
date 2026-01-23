@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, System
 from langchain_aws import BedrockEmbeddings
 from pinecone import Pinecone
 import snowflake.connector
+import json
 
 #Configurations
 AWS_REGION = os.getenv("AWS_REGION")
@@ -92,7 +93,8 @@ def intent_router_node(state: AgentState):
     prompt = (
         f"User Query: {user_text}\n\n"
         "Analyze the query above. If the user is asking about a specific order, "
-        "refund status, or personal transaction, respond with 'INTENT: TRANSACTIONAL'. "
+        "refund status, personal transaction, OR providing their User ID/Email "
+        "for verification, respond with 'INTENT: TRANSACTIONAL'. "
         "If they are asking a general policy question, respond with 'INTENT: GENERAL'."
     )
     
@@ -117,7 +119,58 @@ def intent_router_node(state: AgentState):
     }
 
 def identity_gate(state: AgentState):
-    return state
+    """
+    Feature 2: Hard-coded security node.
+    Acts as a checkpoint that pauses execution if the user is not verified.
+    Attempts to extract credentials from natural language if provided.
+    """
+    # 1. If already verified in state, pass through immediately
+    if state.get("is_verified"):
+        return {"is_verified": True}
+
+    # 2. If not verified, analyze the last message for credentials
+    last_msg = state["messages"][-1].content
+    
+    # Strict prompt to extract credentials ONLY if fully present
+    extraction_prompt = (
+        f"Analyze the following user message: \"{last_msg}\"\n\n"
+        "Extract the 'user_id' and 'user_email' if present. "
+        "The user_id might be a number or an alphanumeric string. "
+        "Return the result EXCLUSIVELY as a JSON object with keys 'user_id' and 'user_email'. "
+        "If a value is missing, set it to null. Do not add any conversational text."
+    )
+    
+    try:
+        response = llm.invoke([HumanMessage(content=extraction_prompt)])
+        
+        # Safe extraction of text content from the LLM response
+        res_content = response.content
+        if isinstance(res_content, list):
+            res_text = next((block["text"] for block in res_content if block.get("type") == "text"), "")
+        else:
+            res_text = str(res_content)
+
+        # Parse JSON
+        credentials = json.loads(res_text.strip())
+        user_id = credentials.get("user_id")
+        user_email = credentials.get("user_email")
+
+        # 3. Verification Logic: strictly require BOTH ID and Email
+        if user_id and user_email:
+            # Successful "Identity Challenge"
+            return {
+                "is_verified": True,
+                "user_id": str(user_id),
+                "user_email": str(user_email),
+                "messages": [AIMessage(content=f"Thank you. I have verified your account (ID: {user_id}).")]
+            }
+            
+    except Exception as e:
+        print(f"Identity Extraction failed: {e}")
+    
+    # 4. If extraction fails, return False. 
+    # This triggers the 'route_verification' edge to point to 'request_id_node'.
+    return {"is_verified": False}
 
 def policy_rag_node(state: AgentState):
     """Path A: Pinecone-only lookup for general queries."""
@@ -148,57 +201,56 @@ def policy_rag_node(state: AgentState):
     return {"policy_context": retrieved_text}
 
 def request_id_node(state: AgentState):
+    """
+    Feature 2: The Identity Challenge.
+    This node represents the 'HITL interruption' where the system pauses 
+    to request information from the user.
+    """
     return {
-        "messages": [AIMessage(content="To access your order details, please provide your User ID and Email address.")]
-    }
-
-def verification_node(state: AgentState):
-    # For now, we accept any combination as requested
-    # In a real app, you would validate state["messages"][-1].content here
-    return {
-        "is_verified": True,
-        "messages": [AIMessage(content="Thank you. Identity verified.")]
+        "messages": [AIMessage(content="For security, I need to verify your identity before accessing order details. Please provide your **User ID** and **Email Address**.")]
     }
 
 def secure_data_retrieval(state: AgentState):
-    # CASTING: Ensure user_id is compatible with Snowflake (e.g., Integer)
+    """Modified to handle alphanumeric User IDs safely"""
+    # 1. Get the ID but don't force integer conversion if it's alphanumeric
     raw_user_id = state.get("user_id", "0")
-    try:
+    
+    # Check if it's actually numeric before converting
+    if str(raw_user_id).isdigit():
         user_id = int(raw_user_id)
-    except ValueError:
-        user_id = raw_user_id # Fallback to string if it's a UUID/Hash
+    else:
+        user_id = str(raw_user_id) # Keep as string for UUIDs like '194eb3ef'
 
-    snowflake_data = {"user_exists": False} # Default flag
+    snowflake_data = {"user_exists": False}
     conn = get_snowflake_connection()
     
     try:
         cur = conn.cursor()
+        # Ensure the query treats the ID as a string if necessary
         query = """
         SELECT 
-            c.account_type, c.loyalty_points, t.order_id, 
-            t.order_date, t.shipping_city, t.refunds_last_30d,
-            e.last_login_city, e.device_type
+            c.user_id, c.email, t.transaction_type, 
+            t.transaction_TS, t.shipping_city
         FROM dim_customers c
-        JOIN fact_transactions t ON c.customer_id = t.customer_id
-        JOIN fact_user_events e ON c.customer_id = e.user_id
-        WHERE c.customer_id = %s
-        ORDER BY t.order_date DESC LIMIT 1;
+        JOIN fact_transactions t ON c.user_id = t.user_id
+        WHERE CAST(c.user_id AS STRING) = %s
+        ORDER BY t.transaction_ts DESC ;
         """
-        cur.execute(query, (user_id,))
+        # Snowflake connector handles the string wrapping for %s
+        cur.execute(query, (str(user_id),)) 
         row = cur.fetchone()
         
         if row:
             snowflake_data = {
-                "user_exists": True, # Flag for the LLM
-                "account_type": row[0],
-                "loyalty_points": row[1],
-                "order_id": row[2],
-                "order_date": str(row[3]),
-                "shipping_city": row[4],
-                "refunds_last_30d": row[5],
-                "last_login_city": row[6],
-                "device_type": row[7]
+                "user_exists": True,
+                "user_id": row[0],
+                "email": row[1],
+                "transaction_type": row[2],
+                "transaction_date": str(row[3]),
+                "shipping_city": row[4]
             }
+    except Exception as e:
+        print(f"Database Error: {e}")
     finally:
         cur.close()
         conn.close()
@@ -315,7 +367,6 @@ builder.add_node("intent_router", intent_router_node)
 builder.add_node("identity_check", identity_gate)
 builder.add_node("general_rag", policy_rag_node)
 builder.add_node("request_id", request_id_node)
-builder.add_node("verify_input", verification_node)
 builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("human_review", lambda x: x) # Placeholder for HITL
@@ -328,11 +379,13 @@ def route_intent(state: AgentState):
     return intent
 
 def route_verification(state: AgentState):
-    # If already verified, proceed to data fetch
-    if state.get("is_verified", False):
-        return "data_fetch"
-    # Otherwise, go to the node that asks for credentials
-    return "request_credentials"
+    """
+    Feature 2: Conditional Logic.
+    Prevents access to the Snowflake Tool ('data_fetch') unless is_verified is True.
+    """
+    if state.get("is_verified"):
+        return "data_fetch" # Proceed to Snowflake Gold Tool
+    return "request_credentials" # Halt and challenge the user
 
 # Construct Edges
 builder.add_edge(START, "intent_router")

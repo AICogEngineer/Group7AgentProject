@@ -6,6 +6,9 @@ langgraph-cli[inmem]
 # --- Vector Database (Pinecone) ---
 pinecone
 
+# --- Snowflake Connector ---
+snowflake
+
 # --- Orchestration and Logic ---
 langchain
 langchain-aws
