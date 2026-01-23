@@ -65,7 +65,7 @@ class AgentState(TypedDict, total=False):
     order_context: dict       # From Snowflake
     policy_context: str       # From Pinecone
     fraud_detected: bool      # From Fraud Analysis
-    human_decision: str       # Store the human's verdict: 'approve', 'deny', or 'custom'
+    human_decision: str       # Store the human's verdict: 'approve', 'deny'
     human_feedback: str       # Optional: Notes from the human agent
 
 # --- Initialize Bedrock Client ---
@@ -490,36 +490,56 @@ def llm_refund_decision_node(state: AgentState):
         "messages": [AIMessage(content=user_message)]
     }
 
+def manual_review_node(state: AgentState):
+    """
+    This node is a placeholder for the human agent.
+    When the graph is interrupted here, the human provides 
+    'human_decision' and 'human_feedback' via state update.
+    """
+    # Once resumed, the graph proceeds to the responder.
+    return state
+
 def manual_decision_responder_node(state: AgentState):
     """
-    Synthesizes a response based on a human's manual decision 
-    (e.g., from a UI or previous state update).
+    The LLM takes the human's specific decision and notes 
+    to craft a professional response for the customer.
+    Outputs the decision, feedback, and final message to the state.
     """
-    decision = state.get("human_decision", "pending")
-    feedback = state.get("human_feedback", "No additional notes provided.")
+    # 1. Retrieve the human input from state
+    decision = state.get("human_decision", "Pending")
+    feedback = state.get("human_feedback", "Under review by specialist.")
     
-    system_prompt = SystemMessage(content=(
-        "You are an E-commerce Support Specialist. "
-        "A human agent has made a manual decision on this case. "
-        "Your job is to communicate this decision professionally to the customer."
-    ))
-    
+    # 2. Craft the LLM prompt
     prompt = f"""
-    HUMAN DECISION: {decision}
+    The human agent has reached a decision regarding a customer's request.
+    
+    DECISION: {decision}
     AGENT NOTES: {feedback}
-    USER QUESTION: {state['messages'][-1].content}
-
-    Instructions:
-    - If the decision is 'approve', confirm the request is being processed.
-    - If 'deny', politely explain we cannot fulfill it based on account review.
-    - Be professional and do not mention 'fraud' or 'internal flags'.
+    
+    TASK:
+    Please communicate this decision to the customer professionally.
+    - Do not include an email sign-off (e.g., "Sincerely, Support").
+    - Do not include an email introduction (e.g., "Dear Customer").
+    - Be direct but polite.
     """
     
-    response = llm.invoke([system_prompt, HumanMessage(content=prompt)])
+    # 3. Generate the customer-facing message
+    response = llm.invoke([
+        SystemMessage(content="You are a professional support specialist."), 
+        HumanMessage(content=prompt)
+    ])
+
+    # 4. Extract content safely
+    if isinstance(response.content, list):
+        final_text = next((block["text"] for block in response.content if block.get("type") == "text"), "")
+    else:
+        final_text = str(response.content)
     
+    # 5. Return and update state
     return {
-        "messages": [AIMessage(content=response.content)],
-        "human_decision": decision # Preserve the decision
+        "messages": [AIMessage(content=final_text)],
+        "human_decision": decision,   # Explicitly outputting the decision
+        "human_feedback": feedback    # Explicitly outputting the feedback
     }
 
 def responder_node(state: AgentState):
@@ -610,6 +630,7 @@ builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("data_retrieval_output", data_retrieval_output)
 builder.add_node("refund_decision", llm_refund_decision_node)
+builder.add_node("manual_review", manual_review_node)
 builder.add_node("manual_responder", manual_decision_responder_node)
 builder.add_node("responder", responder_node)
 builder.add_node("forbidden_response", forbidden_response_node)
@@ -631,13 +652,13 @@ def route_verification(state: AgentState):
 def route_after_fraud_check(state: AgentState) -> str:
     intent = state.get("original_intent", "transactional")
 
-    # Transactional intent always skips manual paths
+    # Transactional intent bypasses manual review
     if intent == "transactional":
         return "data_retrieval_output"
 
-    # If fraud is detected for other intents, go to the manual responder
+    # Non-transactional (Refunds) with fraud flags go to Human-in-the-Loop
     if state.get("fraud_detected"):
-        return "manual_responder"
+        return "manual_review"
 
     if intent == "refund":
         return "refund_decision"
@@ -671,14 +692,18 @@ builder.add_conditional_edges(
     "fraud_check",
     route_after_fraud_check,
     {
-        "manual_responder": "manual_responder",
+        "manual_review": "manual_review",
         "refund_decision": "refund_decision",
         "data_retrieval_output": "data_retrieval_output"
     }
 )
+builder.add_edge("manual_review", "manual_responder")
+builder.add_edge("manual_responder", END)
 builder.add_edge("data_retrieval_output", END)
 builder.add_edge("responder", END)
 builder.add_edge("forbidden_response", END)
 
 # Compile with Human-in-the-Loop Interrupt
-app = builder.compile()
+app = builder.compile(
+    interrupt_after=["manual_review"] # The graph PAUSES here
+)
