@@ -6,6 +6,8 @@ import boto3
 from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.errors import Interrupt
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, SystemMessage
 from langchain_aws import BedrockEmbeddings
@@ -60,9 +62,12 @@ class AgentState(TypedDict, total=False):
     intent: str               # 'general' or 'transactional'
     order_context: dict       # From Snowflake
     policy_context: str       # From Pinecone
-    red_flags: List[str]      # Fraud detection
+    fraud_detected: bool      # From Fraud Analysis
     trust_score: float        # Feature 4
     draft_response: str       # Feature 5
+    review_required: bool
+    review_reason: str
+    review_decision: str | None  # "approved" | "rejected" | None
 
 # --- Initialize Bedrock Client ---
 bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
@@ -211,46 +216,56 @@ def request_id_node(state: AgentState):
     }
 
 def secure_data_retrieval(state: AgentState):
-    """Modified to handle alphanumeric User IDs safely"""
-    # 1. Get the ID but don't force integer conversion if it's alphanumeric
-    raw_user_id = state.get("user_id", "0")
-    
-    # Check if it's actually numeric before converting
-    if str(raw_user_id).isdigit():
-        user_id = int(raw_user_id)
-    else:
-        user_id = str(raw_user_id) # Keep as string for UUIDs like '194eb3ef'
+    """Retrieve all orders for a user from Snowflake"""
 
-    snowflake_data = {"user_exists": False}
+    raw_user_id = state.get("user_id", "0")
+
+    # Preserve alphanumeric IDs safely
+    user_id = int(raw_user_id) if str(raw_user_id).isdigit() else str(raw_user_id)
+
+    snowflake_data = {
+        "user_exists": False,
+        "user_id": None,
+        "email": None,
+        "orders": []
+    }
+
     conn = get_snowflake_connection()
-    
+
     try:
         cur = conn.cursor()
-        # Ensure the query treats the ID as a string if necessary
         query = """
         SELECT 
-            c.user_id, c.email, t.transaction_type, 
-            t.transaction_TS, t.shipping_city
+            c.user_id,
+            c.email,
+            t.transaction_type,
+            t.transaction_ts,
+            t.shipping_city
         FROM dim_customers c
-        JOIN fact_transactions t ON c.user_id = t.user_id
+        JOIN fact_transactions t 
+            ON c.user_id = t.user_id
         WHERE CAST(c.user_id AS STRING) = %s
-        ORDER BY t.transaction_ts DESC ;
+        ORDER BY t.transaction_ts DESC;
         """
-        # Snowflake connector handles the string wrapping for %s
-        cur.execute(query, (str(user_id),)) 
-        row = cur.fetchone()
-        
-        if row:
-            snowflake_data = {
-                "user_exists": True,
-                "user_id": row[0],
-                "email": row[1],
-                "transaction_type": row[2],
-                "transaction_date": str(row[3]),
-                "shipping_city": row[4]
-            }
+
+        cur.execute(query, (str(user_id),))
+        rows = cur.fetchall()
+
+        if rows:
+            snowflake_data["user_exists"] = True
+            snowflake_data["user_id"] = rows[0][0]
+            snowflake_data["email"] = rows[0][1]
+
+            for row in rows:
+                snowflake_data["orders"].append({
+                    "transaction_type": row[2],
+                    "transaction_date": str(row[3]),
+                    "shipping_city": row[4]
+                })
+
     except Exception as e:
         print(f"Database Error: {e}")
+
     finally:
         cur.close()
         conn.close()
@@ -266,22 +281,132 @@ def secure_data_retrieval(state: AgentState):
 
 def fraud_analysis_node(state: AgentState):
     """FEATURE 3: Red Flag Logic using Gold Zone schema fields."""
-    flags = []
-    order = state.get("order_context", {})
+    fraud_detected = False
+
+    order_context = state.get("order_context", {})
+    orders = order_context.get("orders", [])
+
+    for order in orders:
+        if order.get("transaction_type", "").lower() == "chargeback":
+            fraud_detected = True
     
     # Check 1: Refund Velocity (Existing)
-    if order.get("refunds_last_30d", 0) > 3:
-        flags.append("REFUND_VELOCITY_EXCEEDED")
+    #if orders.get("refunds_last_30d", 0) > 3:
+    #    fraud_detected = True
         
     # Check 2: Distance Discrepancy (Based on your SQL schema)
     # Compares shipping_city (Transactions) vs last_login_city (Events)
-    ship_city = order.get("shipping_city")
-    login_city = order.get("last_login_city")
+    #ship_city = orders.get("shipping_city")
+    #login_city = orders.get("last_login_city")
     
-    if ship_city and login_city and ship_city != login_city:
-        flags.append("LOCATION_DISCREPANCY")
+    #if ship_city and login_city and ship_city != login_city:
+    #    fraud_detected = True
         
-    return {"red_flags": flags}
+    return {
+        "fraud_detected": fraud_detected
+    }
+
+def human_review_node(state: AgentState):
+    """
+    HITL node — pauses execution and waits for human input
+    """
+
+    return state
+
+def data_retrieval_output(state: AgentState):
+    """LLM-driven response grounded heavily in user order data."""
+
+    system_prompt = SystemMessage(content=(
+        "You are an E-commerce Support Specialist. "
+        "You help customers understand their orders, shipments, returns, and account activity. "
+        "You must base your answer ONLY on the order data and policy context provided. "
+        "If the requested information is not present, clearly say so. "
+        "Do not speculate, infer hidden systems, or mention internal processes."
+    ))
+
+    forbidden_flags = [
+        "retention vip", "returnless refund", "red flag",
+        "trust score", "refund tier", "trust", "score",
+        "fraud", "velocity"
+    ]
+
+    # --- Pull context ---
+    policy_context = state.get("policy_context", "No policy found.")
+    order_context = state.get("order_context", {})
+    user_question = state["messages"][-1].content
+
+    # --- Normalize order data for the LLM ---
+    orders = order_context.get("orders", [])
+
+    if orders:
+        formatted_orders = "\n".join(
+            f"- {o['transaction_type']} on {o['transaction_date']} (Shipping city: {o['shipping_city']})"
+            for o in orders
+        )
+    else:
+        formatted_orders = "No orders were found for this user."
+
+    order_summary = f"""
+    User ID: {order_context.get('user_id', 'Unknown')}
+    Email: {order_context.get('email', 'Unknown')}
+
+    Orders:
+    {formatted_orders}
+    """
+
+    # --- Final prompt ---
+    prompt = f"""
+    POLICY CONTEXT:
+    {policy_context}
+
+    ORDER DATA:
+    {order_summary}
+
+    USER QUESTION:
+    {user_question}
+
+    Instructions:
+    - Answer the user's question directly.
+    - Reference specific orders when relevant (dates, type, location).
+    - If the data does not contain the answer, say so clearly and politely.
+    - Keep the response professional, clear, and customer-friendly.
+    """
+
+    response = llm.invoke([
+        system_prompt,
+        HumanMessage(content=prompt)
+    ])
+
+    # --- Safely extract model output ---
+    if isinstance(response.content, list):
+        final_text = next(
+            (block.get("text", "") for block in response.content if block.get("type") == "text"),
+            ""
+        )
+    else:
+        final_text = str(response.content)
+
+    # --- Sanitize forbidden content ---
+    sentences = re.split(r'(?<=[.!?]) +', final_text)
+    clean_sentences = [
+        s for s in sentences
+        if not any(flag.lower() in s.lower() for flag in forbidden_flags)
+    ]
+
+    sanitized_response = " ".join(clean_sentences)
+
+    # --- Fallback if over-sanitized ---
+    if not sanitized_response.strip():
+        sanitized_response = (
+            "I’ve reviewed your account and order details. "
+            "At this time, I’m unable to provide a complete answer based on the available information. "
+            "A support specialist can assist further if needed."
+        )
+
+    return {
+        "messages": [AIMessage(content=sanitized_response)],
+        "draft_response": sanitized_response
+    }
 
 def responder_node(state: AgentState):
     """Synthesizes the final answer for the user."""
@@ -369,7 +494,8 @@ builder.add_node("general_rag", policy_rag_node)
 builder.add_node("request_id", request_id_node)
 builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
-builder.add_node("human_review", lambda x: x) # Placeholder for HITL
+builder.add_node("data_retrieval_output", data_retrieval_output)
+builder.add_node("human_review", human_review_node)
 builder.add_node("responder", responder_node)
 builder.add_node("forbidden_response", forbidden_response_node)
 
@@ -386,6 +512,12 @@ def route_verification(state: AgentState):
     if state.get("is_verified"):
         return "data_fetch" # Proceed to Snowflake Gold Tool
     return "request_credentials" # Halt and challenge the user
+
+def route_after_fraud_check(state: AgentState) -> str:
+    if state.get("fraud_detected"):
+        return "human_review"
+    else:
+        return "data_retrieval_output"
 
 # Construct Edges
 builder.add_edge(START, "intent_router")
@@ -408,10 +540,20 @@ builder.add_conditional_edges(
 )
 builder.add_edge("general_rag", "responder")
 builder.add_edge("data_fetch", "fraud_check")
-builder.add_edge("fraud_check", "human_review")
-builder.add_edge("human_review", "responder")
+builder.add_conditional_edges(
+    "fraud_check",
+    route_after_fraud_check,
+    {
+        "human_review": "human_review",
+        "data_retrieval_output": "data_retrieval_output"
+    }
+)
+builder.add_edge("human_review", "data_retrieval_output")
+builder.add_edge("data_retrieval_output", END)
 builder.add_edge("responder", END)
 builder.add_edge("forbidden_response", END)
 
 # Compile with Human-in-the-Loop Interrupt
-app = builder.compile(interrupt_before=["human_review"])
+app = builder.compile(
+    interrupt_before=["human_review"]
+)
