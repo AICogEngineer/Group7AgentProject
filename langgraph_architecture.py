@@ -10,11 +10,23 @@ from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, SystemMessage
 from langchain_aws import BedrockEmbeddings
 from pinecone import Pinecone
+import snowflake.connector
 
 #Configurations
 AWS_REGION = os.getenv("AWS_REGION")
 BEARER_TOKEN = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
 BEDROCK_MODEL_ID = "amazon.titan-embed-text-v2:0"
+
+# Snowflake Connection Function 
+def get_snowflake_connection():
+    return snowflake.connector.connect(
+        user=os.getenv("SNOWFLAKE_USER"),
+        password=os.getenv("SNOWFLAKE_PASSWORD"),
+        account=os.getenv("SNOWFLAKE_ACCOUNT"),
+        warehouse=os.getenv("SNOWFLAKE_WAREHOUSE"),
+        database=os.getenv("SNOWFLAKE_DATABASE"),
+        schema=os.getenv("SNOWFLAKE_SCHEMA")
+    )
 
 # Setup Bedrock Client with the Bearer Token
 # This matches your ingestion setup
@@ -149,28 +161,74 @@ def verification_node(state: AgentState):
     }
 
 def secure_data_retrieval(state: AgentState):
-    snowflake_data = {"order_date": "2025-12-01", "refunds_last_30d": 5}
+    # CASTING: Ensure user_id is compatible with Snowflake (e.g., Integer)
+    raw_user_id = state.get("user_id", "0")
+    try:
+        user_id = int(raw_user_id)
+    except ValueError:
+        user_id = raw_user_id # Fallback to string if it's a UUID/Hash
+
+    snowflake_data = {"user_exists": False} # Default flag
+    conn = get_snowflake_connection()
     
-    # Use the original request for the policy search
-    original_query = state['messages'][0].content
-    query_vector = embeddings.embed_query(original_query)
+    try:
+        cur = conn.cursor()
+        query = """
+        SELECT 
+            c.account_type, c.loyalty_points, t.order_id, 
+            t.order_date, t.shipping_city, t.refunds_last_30d,
+            e.last_login_city, e.device_type
+        FROM dim_customers c
+        JOIN fact_transactions t ON c.customer_id = t.customer_id
+        JOIN fact_user_events e ON c.customer_id = e.user_id
+        WHERE c.customer_id = %s
+        ORDER BY t.order_date DESC LIMIT 1;
+        """
+        cur.execute(query, (user_id,))
+        row = cur.fetchone()
+        
+        if row:
+            snowflake_data = {
+                "user_exists": True, # Flag for the LLM
+                "account_type": row[0],
+                "loyalty_points": row[1],
+                "order_id": row[2],
+                "order_date": str(row[3]),
+                "shipping_city": row[4],
+                "refunds_last_30d": row[5],
+                "last_login_city": row[6],
+                "device_type": row[7]
+            }
+    finally:
+        cur.close()
+        conn.close()
+
+    # Pinecone logic
+    user_query = state['messages'][-1].content
+    query_vector = embeddings.embed_query(user_query)
+    results = index.query(vector=query_vector, top_k=1, include_metadata=True)
     
-    results = index_data.query(vector=query_vector, top_k=1, include_metadata=True)
-    
-    # ROBUST CHECK: Verify matches exists and has at least one item
-    if results and 'matches' in results and len(results['matches']) > 0:
-        policy_data = results['matches'][0]['metadata'].get('text', 'Policy text missing')
-    else:
-        # Fallback if no matching policy is found in Pinecone
-        policy_data = "No specific policy found for this request. Reverting to standard support procedures."
+    policy_data = results['matches'][0]['metadata'].get('text', '') if results.get('matches') else "No policy found."
     
     return {"order_context": snowflake_data, "policy_context": policy_data}
 
 def fraud_analysis_node(state: AgentState):
-    """FEATURE 3: Red Flag Logic."""
+    """FEATURE 3: Red Flag Logic using Gold Zone schema fields."""
     flags = []
-    if state["order_context"]["refunds_last_30d"] > 3:
+    order = state.get("order_context", {})
+    
+    # Check 1: Refund Velocity (Existing)
+    if order.get("refunds_last_30d", 0) > 3:
         flags.append("REFUND_VELOCITY_EXCEEDED")
+        
+    # Check 2: Distance Discrepancy (Based on your SQL schema)
+    # Compares shipping_city (Transactions) vs last_login_city (Events)
+    ship_city = order.get("shipping_city")
+    login_city = order.get("last_login_city")
+    
+    if ship_city and login_city and ship_city != login_city:
+        flags.append("LOCATION_DISCREPANCY")
+        
     return {"red_flags": flags}
 
 def responder_node(state: AgentState):
