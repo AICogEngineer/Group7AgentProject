@@ -12,7 +12,6 @@ from langchain_aws import BedrockEmbeddings
 from pinecone import Pinecone
 
 #Configurations
-INDEX_NAME = "ecommerce-policy-rag"
 AWS_REGION = os.getenv("AWS_REGION")
 BEARER_TOKEN = os.getenv("AWS_BEARER_TOKEN_BEDROCK")
 BEDROCK_MODEL_ID = "amazon.titan-embed-text-v2:0"
@@ -34,6 +33,7 @@ embeddings = BedrockEmbeddings(
 # Setup Pinecone Index
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index = pc.Index("ecommerce-policy-rag")
+index_data = pc.Index("ecommerce-policy-return-rag")
 
 
 AWS_BEARER_TOKEN_BEDROCK = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
@@ -42,6 +42,7 @@ AWS_BEARER_TOKEN_BEDROCK = os.environ.get("AWS_BEARER_TOKEN_BEDROCK")
 class AgentState(TypedDict, total=False):
     messages: Annotated[List[BaseMessage], add_messages]
     user_id: str
+    user_email: str
     is_verified: bool
     intent: str               # 'general' or 'transactional'
     order_context: dict       # From Snowflake
@@ -104,11 +105,7 @@ def intent_router_node(state: AgentState):
     }
 
 def identity_gate(state: AgentState):
-    """FEATURE 2: Security Gate. Interrupts if verification is missing."""
-    if state["is_verified"]:
-        return state
-    # This will trigger a return to the user in the graph flow
-    return {"messages": state["messages"] + [HumanMessage(content="IDENTITY_REQUIRED")]}
+    return state
 
 def policy_rag_node(state: AgentState):
     """Path A: Pinecone-only lookup for general queries."""
@@ -138,26 +135,34 @@ def policy_rag_node(state: AgentState):
 
     return {"policy_context": retrieved_text}
 
+def request_id_node(state: AgentState):
+    return {
+        "messages": [AIMessage(content="To access your order details, please provide your User ID and Email address.")]
+    }
+
+def verification_node(state: AgentState):
+    # For now, we accept any combination as requested
+    # In a real app, you would validate state["messages"][-1].content here
+    return {
+        "is_verified": True,
+        "messages": [AIMessage(content="Thank you. Identity verified.")]
+    }
+
 def secure_data_retrieval(state: AgentState):
-    """FEATURE 1: Dual-tool call (Snowflake + Pinecone) after verification."""
-    # 1. Fetch from Snowflake Gold Zone (Stay Mocked for now)
     snowflake_data = {"order_date": "2025-12-01", "refunds_last_30d": 5}
     
-    # 2. Real Fetch from Pinecone
-    user_query = state['messages'][-1].content
-    query_vector = embeddings.embed_query(user_query)
+    # Use the original request for the policy search
+    original_query = state['messages'][0].content
+    query_vector = embeddings.embed_query(original_query)
     
-    results = index.query(
-        vector=query_vector, 
-        top_k=1, 
-        include_metadata=True
-    )
+    results = index_data.query(vector=query_vector, top_k=1, include_metadata=True)
     
-    # SAFE CHECK: Always check if matches exists before accessing index [0]
+    # ROBUST CHECK: Verify matches exists and has at least one item
     if results and 'matches' in results and len(results['matches']) > 0:
         policy_data = results['matches'][0]['metadata'].get('text', 'Policy text missing')
     else:
-        policy_data = "No relevant policy found for this specific query."
+        # Fallback if no matching policy is found in Pinecone
+        policy_data = "No specific policy found for this request. Reverting to standard support procedures."
     
     return {"order_context": snowflake_data, "policy_context": policy_data}
 
@@ -181,9 +186,16 @@ def responder_node(state: AgentState):
         "2. If an order requires manual review, simply state: 'This request requires additional verification by our specialist team.'"
         "3. Use generic terms like 'System Verification' instead of mentioning fraud, flags, or tiers."
         "4. Treat the 'Context' provided as internal knowledge: Answer based on it, but never quote it directly."
+        "5. DO NOT user percetanges or specific dollar amounts in your response."
+        "6. Be consise and professional in your responses."
+        "7. Focus on customer satisfaction and clarity."
+        "8. Address the customers questions directly based on the provided context."
+        "9. When answering general refund questions, do not mention any internal terms or policies."
+        "10. Be specific when addressing policies which apply to all customers."
+        "11. Do not use email style sign-offs."
     ))
 
-    forbidden_flags = ["retention vip", "returnless refund", "red flag", "trust score", "refund tier"]
+    forbidden_flags = ["retention vip", "returnless refund", "red flag", "trust score", "refund tier", "trust", "score", "fraud", "velocity"]
 
     # Use the context gathered in previous nodes
     context = state.get("policy_context", "No policy found.")
@@ -244,6 +256,8 @@ builder = StateGraph(AgentState)
 builder.add_node("intent_router", intent_router_node)
 builder.add_node("identity_check", identity_gate)
 builder.add_node("general_rag", policy_rag_node)
+builder.add_node("request_id", request_id_node)
+builder.add_node("verify_input", verification_node)
 builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("human_review", lambda x: x) # Placeholder for HITL
@@ -256,7 +270,11 @@ def route_intent(state: AgentState):
     return intent
 
 def route_verification(state: AgentState):
-    return "data_fetch" if state["is_verified"] else END
+    # If already verified, proceed to data fetch
+    if state.get("is_verified", False):
+        return "data_fetch"
+    # Otherwise, go to the node that asks for credentials
+    return "request_credentials"
 
 # Construct Edges
 builder.add_edge(START, "intent_router")
@@ -274,10 +292,9 @@ builder.add_conditional_edges(
     route_verification,
     {
         "data_fetch": "data_fetch",
-        "END": END
+        "request_credentials": "request_id"
     }
 )
-
 builder.add_edge("general_rag", "responder")
 builder.add_edge("data_fetch", "fraud_check")
 builder.add_edge("fraud_check", "human_review")
