@@ -130,7 +130,8 @@ def secure_data_retrieval(state: AgentState):
         SELECT 
             c.account_type, c.loyalty_points, t.order_id, 
             t.order_date, t.shipping_city, t.refunds_last_30d,
-            e.last_login_city, e.device_type
+            e.last_login_city, e.device_type,
+            t.transaction_type
         FROM dim_customers c
         JOIN fact_transactions t ON c.customer_id = t.customer_id
         JOIN fact_user_events e ON c.customer_id = e.user_id
@@ -150,7 +151,8 @@ def secure_data_retrieval(state: AgentState):
                 "shipping_city": row[4],
                 "refunds_last_30d": row[5],
                 "last_login_city": row[6],
-                "device_type": row[7]
+                "device_type": row[7],
+                "transaction_type": row[8]
             }
     finally:
         cur.close()
@@ -170,23 +172,38 @@ def fraud_analysis_node(state: AgentState):
     flags = []
     order = state.get("order_context", {})
     
-    # Check 1: Refund Velocity (Existing)
+    # Check 1: Refund Velocity
     if order.get("refunds_last_30d", 0) > 3:
         flags.append("REFUND_VELOCITY_EXCEEDED")
         
-    # Check 2: Distance Discrepancy (Based on your SQL schema)
-    # Compares shipping_city (Transactions) vs last_login_city (Events)
+    # Check 2: Distance Discrepancy
     ship_city = order.get("shipping_city")
     login_city = order.get("last_login_city")
-    
     if ship_city and login_city and ship_city != login_city:
         flags.append("LOCATION_DISCREPANCY")
         
+    # Check 3: Chargeback Detection
+    tx_type = order.get("transaction_type", "").lower()
+    if "charge back" in tx_type or "chargeback" in tx_type:
+        flags.append("CHARGEBACK_DETECTED")
+
+    # Important: Return the state update here
     return {"red_flags": flags}
+
+def route_fraud(state: AgentState):
+    """
+    Logic: If red_flags list has items, route to manual review.
+    Otherwise, send to the next responder.
+    """
+    if state.get("red_flags"):
+        return "human_review"
+    return "responder"
+
 
 # --- Graph Construction ---
 
 builder = StateGraph(AgentState)
+
 
 # Define Nodes
 builder.add_node("intent_router", intent_router_node)
@@ -195,6 +212,7 @@ builder.add_node("general_rag", policy_rag_node)
 builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("human_review", lambda x: x) # Placeholder for HITL
+builder.add_node("responder", lambda x: x) # Placeholder for your responder logic
 
 # Define Routing Logic
 def route_intent(state: AgentState):
@@ -207,11 +225,19 @@ def route_verification(state: AgentState):
 builder.set_entry_point("intent_router")
 builder.add_conditional_edges("intent_router", route_intent)
 builder.add_conditional_edges("identity_check", route_verification)
+builder.add_conditional_edges(
+    "fraud_check",
+    route_fraud,
+    {
+        "human_review": "human_review",
+        "responder": "responder"
+    }
+)
 
 builder.add_edge("general_rag", END)
 builder.add_edge("data_fetch", "fraud_check")
-builder.add_edge("fraud_check", "human_review")
 builder.add_edge("human_review", END)
+builder.add_edge("responder", END)
 
 # Compile with Human-in-the-Loop Interrupt
 app = builder.compile(interrupt_before=["human_review"])
