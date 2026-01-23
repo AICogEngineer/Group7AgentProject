@@ -14,6 +14,7 @@ from langchain_aws import BedrockEmbeddings
 from pinecone import Pinecone
 import snowflake.connector
 import json
+from datetime import datetime, timedelta
 
 #Configurations
 AWS_REGION = os.getenv("AWS_REGION")
@@ -60,14 +61,12 @@ class AgentState(TypedDict, total=False):
     user_email: str
     is_verified: bool
     intent: str               # 'general' or 'transactional'
+    original_intent: str
     order_context: dict       # From Snowflake
     policy_context: str       # From Pinecone
     fraud_detected: bool      # From Fraud Analysis
-    trust_score: float        # Feature 4
-    draft_response: str       # Feature 5
-    review_required: bool
-    review_reason: str
-    review_decision: str | None  # "approved" | "rejected" | None
+    human_decision: str       # Store the human's verdict: 'approve', 'deny', or 'custom'
+    human_feedback: str       # Optional: Notes from the human agent
 
 # --- Initialize Bedrock Client ---
 bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
@@ -80,46 +79,48 @@ llm = ChatBedrockConverse(
 # --- Node Logic ---
 
 def intent_router_node(state: AgentState):
-    """AI decides the intent directly and we extract it from the message content."""
-    
-    # Get the user's last message text safely
+    # If intent already set, DO NOT overwrite it
+    if state.get("original_intent"):
+        return {"intent": state["original_intent"]}
+
     last_msg = state["messages"][-1].content
     user_text = last_msg[0].get("text", "") if isinstance(last_msg, list) else str(last_msg)
 
     forbidden_flags = ["retention vip", "returnless refund", "red flag", "trust score", "refund tier"]
-    # Check if the user is asking about internal-only terms
     if any(flag in user_text for flag in forbidden_flags):
         return {
-            "intent": "forbidden_query", 
+            "intent": "forbidden_query",
             "messages": [AIMessage(content="I cannot answer questions on these topics due to internal policies.")]
         }
 
-    # Force the model to categorize the intent in its response
     prompt = (
         f"User Query: {user_text}\n\n"
-        "Analyze the query above. If the user is asking about a specific order, "
-        "refund status, personal transaction, OR providing their User ID/Email "
-        "for verification, respond with 'INTENT: TRANSACTIONAL'. "
-        "If they are asking a general policy question, respond with 'INTENT: GENERAL'."
+        "Analyze the query. Return EXACTLY ONE of the following:\n"
+        "- INTENT: REFUND (if user asks about refund or refund status)\n"
+        "- INTENT: TRANSACTIONAL (if user asks about an order or personal transaction)\n"
+        "- INTENT: GENERAL (if user asks general policy)\n"
     )
-    
-    # Invoke the model
+
     response = llm.invoke([HumanMessage(content=prompt)])
-    
-    # Safely extract text from Nova's content list
-    # Nova content is often: [{'type': 'text', 'text': '...'}]
+
     res_content = response.content
     if isinstance(res_content, list):
         conclusion = next((block["text"] for block in res_content if block.get("type") == "text"), "")
     else:
         conclusion = str(res_content)
 
-    # Decide intent based on the model's text conclusion
     conclusion = conclusion.upper()
-    intent = "transactional" if "INTENT: TRANSACTIONAL" in conclusion else "general"
-    
+    if "INTENT: REFUND" in conclusion:
+        intent = "refund"
+    elif "INTENT: TRANSACTIONAL" in conclusion:
+        intent = "transactional"
+    else:
+        intent = "general"
+
+    # Lock it in
     return {
         "intent": intent,
+        "original_intent": intent,
         "messages": [AIMessage(content=conclusion)]
     }
 
@@ -234,13 +235,15 @@ def secure_data_retrieval(state: AgentState):
 
     try:
         cur = conn.cursor()
+
         query = """
         SELECT 
             c.user_id,
             c.email,
             t.transaction_type,
             t.transaction_ts,
-            t.shipping_city
+            t.shipping_country,
+            t.billing_country
         FROM dim_customers c
         JOIN fact_transactions t 
             ON c.user_id = t.user_id
@@ -260,7 +263,8 @@ def secure_data_retrieval(state: AgentState):
                 snowflake_data["orders"].append({
                     "transaction_type": row[2],
                     "transaction_date": str(row[3]),
-                    "shipping_city": row[4]
+                    "shipping_country": row[4],
+                    "billing_country": row[5]
                 })
 
     except Exception as e:
@@ -271,8 +275,8 @@ def secure_data_retrieval(state: AgentState):
         conn.close()
 
     # Pinecone logic
-    user_query = state['messages'][-1].content
-    query_vector = embeddings.embed_query(user_query)
+    refund_policy = "what is the refund policy?"
+    query_vector = embeddings.embed_query(refund_policy)
     results = index.query(vector=query_vector, top_k=1, include_metadata=True)
     
     policy_data = results['matches'][0]['metadata'].get('text', '') if results.get('matches') else "No policy found."
@@ -286,22 +290,42 @@ def fraud_analysis_node(state: AgentState):
     order_context = state.get("order_context", {})
     orders = order_context.get("orders", [])
 
+    now = datetime.now()
+    thirty_days_ago = now - timedelta(days=30)
+    refunds_last_30d = 0
+
     for order in orders:
-        if order.get("transaction_type", "").lower() == "chargeback":
+        tx_type = order.get("transaction_type", "").lower()
+        tx_date_raw = order.get("transaction_date")
+
+        # --- Existing chargeback check ---
+        if tx_type == "chargeback":
             fraud_detected = True
+
+        # --- NEW: Refund velocity check ---
+        if tx_type == "refund" and tx_date_raw:
+            try:
+                tx_date = datetime.fromisoformat(tx_date_raw)
+                if tx_date >= thirty_days_ago:
+                    refunds_last_30d += 1
+            except ValueError:
+                # Ignore malformed dates safely
+                continue
     
-    # Check 1: Refund Velocity (Existing)
-    #if orders.get("refunds_last_30d", 0) > 3:
-    #    fraud_detected = True
-        
-    # Check 2: Distance Discrepancy (Based on your SQL schema)
-    # Compares shipping_city (Transactions) vs last_login_city (Events)
-    #ship_city = orders.get("shipping_city")
-    #login_city = orders.get("last_login_city")
-    
-    #if ship_city and login_city and ship_city != login_city:
-    #    fraud_detected = True
-        
+    if refunds_last_30d > 3:
+        fraud_detected = True
+
+    if orders:
+        # Use most recent transaction
+        most_recent_order = orders[0]
+
+        ship_country = most_recent_order.get("shipping_country")
+        billing_country = most_recent_order.get("billing_country")
+
+        # Country mismatch is high risk
+        if ship_country and billing_country and ship_country != billing_country:
+            fraud_detected = True
+
     return {
         "fraud_detected": fraud_detected
     }
@@ -340,7 +364,9 @@ def data_retrieval_output(state: AgentState):
 
     if orders:
         formatted_orders = "\n".join(
-            f"- {o['transaction_type']} on {o['transaction_date']} (Shipping city: {o['shipping_city']})"
+            f"- {o['transaction_type']} on {o['transaction_date']} "
+            f"(Shipping country: {o['shipping_country']}, "
+            f"Billing country: {o['billing_country']})"
             for o in orders
         )
     else:
@@ -351,7 +377,7 @@ def data_retrieval_output(state: AgentState):
     Email: {order_context.get('email', 'Unknown')}
 
     Orders:
-    {formatted_orders}
+    {formatted_orders}   
     """
 
     # --- Final prompt ---
@@ -406,6 +432,94 @@ def data_retrieval_output(state: AgentState):
     return {
         "messages": [AIMessage(content=sanitized_response)],
         "draft_response": sanitized_response
+    }
+
+def llm_refund_decision_node(state: AgentState):
+    policy_context = state.get("policy_context", "")
+    order_context = state.get("order_context", {})
+    fraud_detected = state.get("fraud_detected", False)
+
+    orders = order_context.get("orders", [])
+
+    system_prompt = SystemMessage(content=(
+        "You are a Refund Agent. "
+        "Based ONLY on the policy and order data, "
+        "write a short customer-friendly response. "
+        "Do NOT mention fraud or internal systems."
+    ))
+
+    human_prompt = HumanMessage(content=f"""
+        POLICY CONTEXT:
+        {policy_context}
+
+        ORDER CONTEXT:
+        {orders}
+
+        FRAUD DETECTED:
+        {fraud_detected}
+
+        Write a customer-friendly refund response.
+        If refund should be approved, include the word APPROVED.
+        If refund should be denied, include the word DENIED.
+        If it needs review, include the word REVIEW.
+        Do not use email style sign-offs.
+    """)
+
+    response = llm.invoke([system_prompt, human_prompt])
+
+    # Extract text
+    if isinstance(response.content, list):
+        user_message = next(
+            (block.get("text", "") for block in response.content if block.get("type") == "text"),
+            ""
+        )
+    else:
+        user_message = str(response.content)
+
+    # Determine decision by keyword
+    if "APPROVED" in user_message.upper():
+        decision = "approve_refund"
+    elif "DENIED" in user_message.upper():
+        decision = "deny_refund"
+    else:
+        decision = "send_to_manual_review"
+
+    return {
+        "refund_decision": decision,
+        "refund_reason": "Determined by policy + order context",
+        "messages": [AIMessage(content=user_message)]
+    }
+
+def manual_decision_responder_node(state: AgentState):
+    """
+    Synthesizes a response based on a human's manual decision 
+    (e.g., from a UI or previous state update).
+    """
+    decision = state.get("human_decision", "pending")
+    feedback = state.get("human_feedback", "No additional notes provided.")
+    
+    system_prompt = SystemMessage(content=(
+        "You are an E-commerce Support Specialist. "
+        "A human agent has made a manual decision on this case. "
+        "Your job is to communicate this decision professionally to the customer."
+    ))
+    
+    prompt = f"""
+    HUMAN DECISION: {decision}
+    AGENT NOTES: {feedback}
+    USER QUESTION: {state['messages'][-1].content}
+
+    Instructions:
+    - If the decision is 'approve', confirm the request is being processed.
+    - If 'deny', politely explain we cannot fulfill it based on account review.
+    - Be professional and do not mention 'fraud' or 'internal flags'.
+    """
+    
+    response = llm.invoke([system_prompt, HumanMessage(content=prompt)])
+    
+    return {
+        "messages": [AIMessage(content=response.content)],
+        "human_decision": decision # Preserve the decision
     }
 
 def responder_node(state: AgentState):
@@ -495,13 +609,14 @@ builder.add_node("request_id", request_id_node)
 builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("data_retrieval_output", data_retrieval_output)
-builder.add_node("human_review", human_review_node)
+builder.add_node("refund_decision", llm_refund_decision_node)
+builder.add_node("manual_responder", manual_decision_responder_node)
 builder.add_node("responder", responder_node)
 builder.add_node("forbidden_response", forbidden_response_node)
 
 # Define Routing Logic
 def route_intent(state: AgentState):
-    intent = state.get("intent", "general")
+    intent = state.get("original_intent", "general")
     return intent
 
 def route_verification(state: AgentState):
@@ -514,19 +629,31 @@ def route_verification(state: AgentState):
     return "request_credentials" # Halt and challenge the user
 
 def route_after_fraud_check(state: AgentState) -> str:
-    if state.get("fraud_detected"):
-        return "human_review"
-    else:
+    intent = state.get("original_intent", "transactional")
+
+    # Transactional intent always skips manual paths
+    if intent == "transactional":
         return "data_retrieval_output"
+
+    # If fraud is detected for other intents, go to the manual responder
+    if state.get("fraud_detected"):
+        return "manual_responder"
+
+    if intent == "refund":
+        return "refund_decision"
+    
+    return "data_retrieval_output"
+
 
 # Construct Edges
 builder.add_edge(START, "intent_router")
 builder.add_conditional_edges(
     "intent_router",
-    route_intent, # This is the function we defined earlier
+    route_intent,
     {
-        "transactional": "identity_check", # Map return value to node name
-        "general": "general_rag",           # Map return value to node name
+        "transactional": "identity_check",
+        "refund": "identity_check",
+        "general": "general_rag",
         "forbidden_query": "forbidden_response"
     }
 )
@@ -544,16 +671,14 @@ builder.add_conditional_edges(
     "fraud_check",
     route_after_fraud_check,
     {
-        "human_review": "human_review",
+        "manual_responder": "manual_responder",
+        "refund_decision": "refund_decision",
         "data_retrieval_output": "data_retrieval_output"
     }
 )
-builder.add_edge("human_review", "data_retrieval_output")
 builder.add_edge("data_retrieval_output", END)
 builder.add_edge("responder", END)
 builder.add_edge("forbidden_response", END)
 
 # Compile with Human-in-the-Loop Interrupt
-app = builder.compile(
-    interrupt_before=["human_review"]
-)
+app = builder.compile()
