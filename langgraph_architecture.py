@@ -6,8 +6,6 @@ import boto3
 from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.errors import Interrupt
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, SystemMessage
 from langchain_aws import BedrockEmbeddings
@@ -338,21 +336,17 @@ def human_review_node(state: AgentState):
     return state
 
 def data_retrieval_output(state: AgentState):
-    """LLM-driven response grounded heavily in user order data."""
+    """LLM-driven response grounded heavily in user order data. 
+    Forbidden flag logic removed to ensure all order details are displayed."""
 
     system_prompt = SystemMessage(content=(
         "You are an E-commerce Support Specialist. "
         "You help customers understand their orders, shipments, returns, and account activity. "
-        "You must base your answer ONLY on the order data and policy context provided. "
+        "You must base your answer ONLY on the order data provided. "
         "If the requested information is not present, clearly say so. "
         "Do not speculate, infer hidden systems, or mention internal processes."
+        "ALWAYS list all retrieved orders in a clear bullet format."
     ))
-
-    forbidden_flags = [
-        "retention vip", "returnless refund", "red flag",
-        "trust score", "refund tier", "trust", "score",
-        "fraud", "velocity"
-    ]
 
     # --- Pull context ---
     policy_context = state.get("policy_context", "No policy found.")
@@ -392,7 +386,7 @@ def data_retrieval_output(state: AgentState):
     {user_question}
 
     Instructions:
-    - Answer the user's question directly.
+    - Assume the users identity has been verified.
     - Reference specific orders when relevant (dates, type, location).
     - If the data does not contain the answer, say so clearly and politely.
     - Keep the response professional, clear, and customer-friendly.
@@ -412,26 +406,10 @@ def data_retrieval_output(state: AgentState):
     else:
         final_text = str(response.content)
 
-    # --- Sanitize forbidden content ---
-    sentences = re.split(r'(?<=[.!?]) +', final_text)
-    clean_sentences = [
-        s for s in sentences
-        if not any(flag.lower() in s.lower() for flag in forbidden_flags)
-    ]
-
-    sanitized_response = " ".join(clean_sentences)
-
-    # --- Fallback if over-sanitized ---
-    if not sanitized_response.strip():
-        sanitized_response = (
-            "I’ve reviewed your account and order details. "
-            "At this time, I’m unable to provide a complete answer based on the available information. "
-            "A support specialist can assist further if needed."
-        )
-
+    # Return the content directly without sentence-filtering logic
     return {
-        "messages": [AIMessage(content=sanitized_response)],
-        "draft_response": sanitized_response
+        "messages": [AIMessage(content=final_text)],
+        "draft_response": final_text
     }
 
 def llm_refund_decision_node(state: AgentState):
@@ -705,5 +683,5 @@ builder.add_edge("forbidden_response", END)
 
 # Compile with Human-in-the-Loop Interrupt
 app = builder.compile(
-    interrupt_after=["manual_review"] # The graph PAUSES here
+    interrupt_after=["manual_review"]
 )
