@@ -6,6 +6,7 @@ import boto3
 from typing import TypedDict, List, Optional, Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
+from langgraph.types import interrupt
 from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, BaseMessage, AIMessage, SystemMessage
 from langchain_aws import BedrockEmbeddings
@@ -58,6 +59,7 @@ class AgentState(TypedDict, total=False):
     user_id: str
     user_email: str
     is_verified: bool
+    verification_attempts: int
     intent: str               # 'general' or 'transactional'
     original_intent: str
     order_context: dict       # From Snowflake
@@ -123,58 +125,80 @@ def intent_router_node(state: AgentState):
     }
 
 def identity_gate(state: AgentState):
-    """
-    Feature 2: Hard-coded security node.
-    Acts as a checkpoint that pauses execution if the user is not verified.
-    Attempts to extract credentials from natural language if provided.
-    """
-    # 1. If already verified in state, pass through immediately
+    # Initialize attempts
+    attempts = state.get("verification_attempts", 0)
+
+    # Already verified
     if state.get("is_verified"):
         return {"is_verified": True}
 
-    # 2. If not verified, analyze the last message for credentials
+    # Exceeded retries
+    if attempts >= 3:
+        return {
+            "messages": state["messages"] + [
+                AIMessage(
+                    content=(
+                        "For security reasons, we couldn’t verify your identity "
+                        "after multiple attempts. A specialist will need to assist you."
+                    )
+                )
+            ],
+            "is_verified": False,
+            "verification_attempts": attempts
+        }
+
     last_msg = state["messages"][-1].content
-    
-    # Strict prompt to extract credentials ONLY if fully present
-    extraction_prompt = (
-        f"Analyze the following user message: \"{last_msg}\"\n\n"
-        "Extract the 'user_id' and 'user_email' if present. "
-        "The user_id might be a number or an alphanumeric string. "
-        "Return the result EXCLUSIVELY as a JSON object with keys 'user_id' and 'user_email'. "
-        "If a value is missing, set it to null. Do not add any conversational text."
+
+    extraction_prompt = f"""
+    Extract credentials from the following text.
+
+    TEXT:
+    "{last_msg}"
+
+    Rules:
+    - user_id may be numeric or alphanumeric
+    - email must be a valid email format
+    - fields may be unlabeled
+
+    Return ONLY valid JSON:
+    {{
+      "user_id": string or null,
+      "user_email": string or null
+    }}
+    """
+
+    response = llm.invoke([HumanMessage(content=extraction_prompt)])
+
+    res_text = (
+        next((b["text"] for b in response.content if b.get("type") == "text"), "")
+        if isinstance(response.content, list)
+        else str(response.content)
     )
-    
+
     try:
-        response = llm.invoke([HumanMessage(content=extraction_prompt)])
-        
-        # Safe extraction of text content from the LLM response
-        res_content = response.content
-        if isinstance(res_content, list):
-            res_text = next((block["text"] for block in res_content if block.get("type") == "text"), "")
-        else:
-            res_text = str(res_content)
+        creds = json.loads(res_text)
+    except Exception:
+        creds = {}
 
-        # Parse JSON
-        credentials = json.loads(res_text.strip())
-        user_id = credentials.get("user_id")
-        user_email = credentials.get("user_email")
+    user_id = creds.get("user_id") or state.get("user_id")
+    user_email = creds.get("user_email") or state.get("user_email")
 
-        # 3. Verification Logic: strictly require BOTH ID and Email
-        if user_id and user_email:
-            # Successful "Identity Challenge"
-            return {
-                "is_verified": True,
-                "user_id": str(user_id),
-                "user_email": str(user_email),
-                "messages": [AIMessage(content=f"Thank you. I have verified your account (ID: {user_id}).")]
-            }
-            
-    except Exception as e:
-        print(f"Identity Extraction failed: {e}")
-    
-    # 4. If extraction fails, return False. 
-    # This triggers the 'route_verification' edge to point to 'request_id_node'.
-    return {"is_verified": False}
+    # Persist partial credentials
+    new_state = {
+        "user_id": user_id,
+        "user_email": user_email,
+        "verification_attempts": attempts + 1
+    }
+
+    # TEMP: assume valid if both present
+    if user_id and user_email:
+        new_state["is_verified"] = True
+        new_state["messages"] = state["messages"] + [
+            AIMessage(content="Thank you. Your identity has been verified.")
+        ]
+        return new_state
+
+    return new_state | {"is_verified": False}
 
 def policy_rag_node(state: AgentState):
     """Path A: Pinecone-only lookup for general queries."""
@@ -210,8 +234,26 @@ def request_id_node(state: AgentState):
     This node represents the 'HITL interruption' where the system pauses 
     to request information from the user.
     """
+
+    attempts = state.get("verification_attempts", 0)
+    remaining = max(0, 3 - attempts)
+
     return {
-        "messages": [AIMessage(content="For security, I need to verify your identity before accessing order details. Please provide your **User ID** and **Email Address**.")]
+        "messages": state.get("messages", []) + [AIMessage(content="For security, I need to verify your identity before accessing order details. Please provide your **User ID** and **Email Address**.\n" f"Attempts remaining: {remaining}")]
+    }
+
+def collect_user_input_node(state: AgentState):
+    """
+    Node that explicitly interrupts execution to wait for user input.
+    The input provided in 'resume' is added as a HumanMessage.
+    """
+    # This pauses the graph. The argument is returned to the client/frontend.
+    # The value provided by the user in Command(resume="...") becomes 'user_input'
+    user_input = interrupt("Please provide your ID and Email.")
+    
+    # We wrap the user's raw text into a HumanMessage so the next node sees it as chat
+    return {
+        "messages": [HumanMessage(content=user_input)]
     }
 
 def secure_data_retrieval(state: AgentState):
@@ -604,6 +646,7 @@ builder.add_node("intent_router", intent_router_node)
 builder.add_node("identity_check", identity_gate)
 builder.add_node("general_rag", policy_rag_node)
 builder.add_node("request_id", request_id_node)
+builder.add_node("collect_user_input", collect_user_input_node)
 builder.add_node("data_fetch", secure_data_retrieval)
 builder.add_node("fraud_check", fraud_analysis_node)
 builder.add_node("data_retrieval_output", data_retrieval_output)
@@ -664,6 +707,8 @@ builder.add_conditional_edges(
         "request_credentials": "request_id"
     }
 )
+builder.add_edge("request_id", "collect_user_input")
+builder.add_edge("collect_user_input", "identity_check")
 builder.add_edge("general_rag", "responder")
 builder.add_edge("data_fetch", "fraud_check")
 builder.add_conditional_edges(
@@ -682,6 +727,4 @@ builder.add_edge("responder", END)
 builder.add_edge("forbidden_response", END)
 
 # Compile with Human-in-the-Loop Interrupt
-app = builder.compile(
-    interrupt_after=["manual_review"]
-)
+app = builder.compile(interrupt_after=["manual_review"])
